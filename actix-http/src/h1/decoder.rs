@@ -185,13 +185,6 @@ pub(crate) trait MessageType: Sized {
             content_length = None;
         }
 
-        // disallow HTTP/1.0 request that do not contain a Content-Length headers
-        // see https://datatracker.ietf.org/doc/html/rfc1945#section-7.2.2
-        if version == Version::HTTP_10 && content_length.is_none() {
-            debug!("no Content-Length specified for HTTP/1.0 request");
-            return Err(ParseError::Header);
-        }
-
         // https://datatracker.ietf.org/doc/html/rfc7230#section-3.3.3
         if chunked {
             // Chunked encoding
@@ -272,6 +265,17 @@ impl MessageType for Request {
 
         // convert headers
         let length = msg.set_headers(&src.split_to(len).freeze(), &headers[..h_len], ver)?;
+
+        // TODO: broken because CL: 0 is stripped out in set_headers
+        // disallow HTTP/1.0 POST requests that do not contain a Content-Length headers
+        // see https://datatracker.ietf.org/doc/html/rfc1945#section-7.2.2
+        if ver == Version::HTTP_10
+            && method == Method::POST
+            && matches!(length, PayloadLength::None)
+        {
+            debug!("no Content-Length specified for HTTP/1.0 request");
+            return Err(ParseError::Header);
+        }
 
         // payload decoder
         let decoder = match length {
@@ -628,8 +632,25 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_post() {
-        let mut buf = BytesMut::from("POST /test2 HTTP/1.0\r\n\r\n");
+    fn parse_post() {
+        let mut buf = BytesMut::from(
+            "POST /test2 HTTP/1.0\r\n\
+            Content-Length: 3\r\n\
+            \r\n\
+            abc",
+        );
+
+        let mut reader = MessageDecoder::<Request>::default();
+        let (req, _) = reader.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(req.version(), Version::HTTP_10);
+        assert_eq!(*req.method(), Method::POST);
+        assert_eq!(req.path(), "/test2");
+
+        let mut buf = BytesMut::from(
+            "POST /test2 HTTP/1.0\r\n\
+            Content-Length: 0\r\n\
+            \r\n",
+        );
 
         let mut reader = MessageDecoder::<Request>::default();
         let (req, _) = reader.decode(&mut buf).unwrap().unwrap();
@@ -1034,7 +1055,7 @@ mod tests {
         // in HTTP/1.0 transfer encoding is ignored and must therefore contain a CL header
 
         let mut buf = BytesMut::from(
-            "GET / HTTP/1.0\r\n\
+            "POST / HTTP/1.0\r\n\
             Host: example.com\r\n\
             Transfer-Encoding: chunked\r\n\
             \r\n\
